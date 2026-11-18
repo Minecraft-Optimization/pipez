@@ -106,35 +106,67 @@ public class ItemPipeType extends PipeType<Item, ItemData> {
         }
         int itemsToTransfer = getRate(tileEntity, side);
         int initialItems = itemsToTransfer;
-        boolean[] inventoriesFull = new boolean[connections.size()];
-        int p = tileEntity.getRoundRobinIndex(side, this) % connections.size();
-        while (itemsToTransfer > 0 && hasNotInserted(inventoriesFull)) {
-            PipeTileEntity.Connection connection = connections.get(p);
-            IItemHandler destination = connection.getItemHandler();
-            boolean hasInserted = false;
-            if (destination != null && !inventoriesFull[p] && !isFull(destination)) {
-                for (int j = 0; j < itemHandler.getSlots(); j++) {
-                    ItemStack simulatedExtract = itemHandler.extractItem(j, 1, true);
-                    if (simulatedExtract.isEmpty()) {
-                        continue;
-                    }
-                    if (canInsert(tileEntity.getLevel().registryAccess(), connection, simulatedExtract, tileEntity.getFilters(side, this)) == tileEntity.getFilterMode(side, this).equals(UpgradeTileEntity.FilterMode.BLACKLIST)) {
-                        continue;
-                    }
-                    ItemStack stack = ItemHandlerHelper.insertItem(destination, simulatedExtract, false);
-                    int insertedAmount = simulatedExtract.getCount() - stack.getCount();
-                    if (insertedAmount > 0) {
-                        itemsToTransfer -= insertedAmount;
-                        itemHandler.extractItem(j, insertedAmount, false);
-                        hasInserted = true;
-                        break;
+        int connectionCount = connections.size();
+
+        // Loop invariants, resolved once per operation instead of once per moved item
+        HolderLookup.Provider provider = tileEntity.getLevel().registryAccess();
+        List<Filter<?, ?>> filters = tileEntity.getFilters(side, this);
+        boolean blacklist = tileEntity.getFilterMode(side, this).equals(UpgradeTileEntity.FilterMode.BLACKLIST);
+        int sourceSlots = itemHandler.getSlots();
+
+        // Source slots below this index are known to be empty (we only ever extract during an operation)
+        int firstNonEmptySlot = 0;
+
+        boolean[] inventoriesFull = new boolean[connectionCount];
+        boolean[] fullnessChecked = new boolean[connectionCount];
+        int activeConnections = connectionCount;
+        int p = tileEntity.getRoundRobinIndex(side, this) % connectionCount;
+
+        while (itemsToTransfer > 0 && activeConnections > 0) {
+            if (!inventoriesFull[p]) {
+                PipeTileEntity.Connection connection = connections.get(p);
+                IItemHandler destination = connection.getItemHandler();
+                boolean hasInserted = false;
+
+                // isFull is expensive on some inventories (e.g. Mekanism), so only check it on the first visit.
+                // After that a failed insert marks the destination as full anyway.
+                boolean skip = destination == null;
+                if (!skip && !fullnessChecked[p]) {
+                    fullnessChecked[p] = true;
+                    skip = isFull(destination);
+                }
+
+                if (!skip) {
+                    // Move an equal share per visit instead of a single item
+                    int chunk = (itemsToTransfer + activeConnections - 1) / activeConnections;
+                    for (int j = firstNonEmptySlot; j < sourceSlots; j++) {
+                        ItemStack simulatedExtract = itemHandler.extractItem(j, chunk, true);
+                        if (simulatedExtract.isEmpty()) {
+                            if (j == firstNonEmptySlot) {
+                                firstNonEmptySlot++;
+                            }
+                            continue;
+                        }
+                        if (canInsert(provider, connection, simulatedExtract, filters) == blacklist) {
+                            continue;
+                        }
+                        ItemStack stack = ItemHandlerHelper.insertItem(destination, simulatedExtract, false);
+                        int insertedAmount = simulatedExtract.getCount() - stack.getCount();
+                        if (insertedAmount > 0) {
+                            itemsToTransfer -= insertedAmount;
+                            itemHandler.extractItem(j, insertedAmount, false);
+                            hasInserted = true;
+                            break;
+                        }
                     }
                 }
+
+                if (!hasInserted) {
+                    inventoriesFull[p] = true;
+                    activeConnections--;
+                }
             }
-            if (!hasInserted) {
-                inventoriesFull[p] = true;
-            }
-            p = (p + 1) % connections.size();
+            p = (p + 1) % connectionCount;
         }
 
         tileEntity.setRoundRobinIndex(side, this, p);
@@ -236,15 +268,6 @@ public class ItemPipeType extends PipeType<Item, ItemData> {
             }
             return filter.getTag() == null || filter.getTag().contains(stack.getItem());
         }
-    }
-
-    private boolean hasNotInserted(boolean[] inventoriesFull) {
-        for (boolean b : inventoriesFull) {
-            if (!b) {
-                return true;
-            }
-        }
-        return false;
     }
 
     private boolean containsStackable(ArrayList<ItemStack> list, ItemStack stack) {
