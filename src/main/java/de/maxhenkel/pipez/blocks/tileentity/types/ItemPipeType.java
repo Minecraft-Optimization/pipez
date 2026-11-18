@@ -19,7 +19,6 @@ import net.minecraft.world.item.ItemStack;
 import net.neoforged.neoforge.capabilities.BlockCapability;
 import net.neoforged.neoforge.capabilities.Capabilities;
 import net.neoforged.neoforge.items.IItemHandler;
-import net.neoforged.neoforge.items.ItemHandlerHelper;
 
 import javax.annotation.Nullable;
 import java.util.ArrayList;
@@ -113,30 +112,26 @@ public class ItemPipeType extends PipeType<Item, ItemData> {
         List<Filter<?, ?>> filters = tileEntity.getFilters(side, this);
         boolean blacklist = tileEntity.getFilterMode(side, this).equals(UpgradeTileEntity.FilterMode.BLACKLIST);
         int sourceSlots = itemHandler.getSlots();
+        long gameTime = tileEntity.getLevel().getGameTime();
+        boolean backoff = Main.SERVER_CONFIG.backoffEnabled.get();
 
         // Source slots below this index are known to be empty (we only ever extract during an operation)
         int firstNonEmptySlot = 0;
 
-        boolean[] inventoriesFull = new boolean[connectionCount];
-        boolean[] fullnessChecked = new boolean[connectionCount];
+        // Destination state is resolved lazily on the first visit of each connection
+        Target[] targets = new Target[connectionCount];
         int activeConnections = connectionCount;
         int p = tileEntity.getRoundRobinIndex(side, this) % connectionCount;
 
         while (itemsToTransfer > 0 && activeConnections > 0) {
-            if (!inventoriesFull[p]) {
-                PipeTileEntity.Connection connection = connections.get(p);
-                IItemHandler destination = connection.getItemHandler();
+            Target target = targets[p];
+            if (target == null) {
+                target = targets[p] = new Target(connections.get(p), side, gameTime, backoff);
+            }
+            if (!target.done) {
                 boolean hasInserted = false;
 
-                // isFull is expensive on some inventories (e.g. Mekanism), so only check it on the first visit.
-                // After that a failed insert marks the destination as full anyway.
-                boolean skip = destination == null;
-                if (!skip && !fullnessChecked[p]) {
-                    fullnessChecked[p] = true;
-                    skip = isFull(destination);
-                }
-
-                if (!skip) {
+                if (target.handler != null) {
                     // Move an equal share per visit instead of a single item
                     int chunk = (itemsToTransfer + activeConnections - 1) / activeConnections;
                     for (int j = firstNonEmptySlot; j < sourceSlots; j++) {
@@ -147,26 +142,44 @@ public class ItemPipeType extends PipeType<Item, ItemData> {
                             }
                             continue;
                         }
-                        if (canInsert(provider, connection, simulatedExtract, filters) == blacklist) {
+                        // Don't offer an item this destination already refused during this operation
+                        if (target.hasRejected(simulatedExtract)) {
                             continue;
                         }
-                        ItemStack stack = ItemHandlerHelper.insertItem(destination, simulatedExtract, false);
+                        if (canInsert(provider, target.connection, simulatedExtract, filters) == blacklist) {
+                            target.reject(simulatedExtract);
+                            continue;
+                        }
+                        ItemStack stack = insertItem(target.handler, target.slots, simulatedExtract);
                         int insertedAmount = simulatedExtract.getCount() - stack.getCount();
                         if (insertedAmount > 0) {
                             itemsToTransfer -= insertedAmount;
                             itemHandler.extractItem(j, insertedAmount, false);
+                            target.inserted = true;
                             hasInserted = true;
                             break;
                         }
+                        target.refused = true;
+                        target.reject(simulatedExtract);
                     }
                 }
 
                 if (!hasInserted) {
-                    inventoriesFull[p] = true;
+                    target.done = true;
                     activeConnections--;
                 }
             }
             p = (p + 1) % connectionCount;
+        }
+
+        if (backoff) {
+            int increment = Main.SERVER_CONFIG.backoffIncrement.get();
+            int maxDelay = Main.SERVER_CONFIG.backoffMaxDelay.get();
+            for (Target target : targets) {
+                if (target != null) {
+                    target.applyBackoff(side, gameTime, increment, maxDelay);
+                }
+            }
         }
 
         tileEntity.setRoundRobinIndex(side, this, p);
@@ -177,22 +190,39 @@ public class ItemPipeType extends PipeType<Item, ItemData> {
         int itemsToTransfer = getRate(tileEntity, side);
         int initialItems = itemsToTransfer;
 
+        HolderLookup.Provider provider = tileEntity.getLevel().registryAccess();
+        List<Filter<?, ?>> filters = tileEntity.getFilters(side, this);
+        boolean blacklist = tileEntity.getFilterMode(side, this).equals(UpgradeTileEntity.FilterMode.BLACKLIST);
+        int sourceSlots = itemHandler.getSlots();
+        long gameTime = tileEntity.getLevel().getGameTime();
+        boolean backoff = Main.SERVER_CONFIG.backoffEnabled.get();
+        int increment = Main.SERVER_CONFIG.backoffIncrement.get();
+        int maxDelay = Main.SERVER_CONFIG.backoffMaxDelay.get();
+
         ArrayList<ItemStack> nonFittingItems = new ArrayList<>();
 
-        connectionLoop:
         for (PipeTileEntity.Connection connection : connections) {
-            nonFittingItems.clear();
+            if (itemsToTransfer <= 0) {
+                break;
+            }
+            if (backoff && connection.isBackedOff(side, gameTime)) {
+                continue;
+            }
             IItemHandler destination = connection.getItemHandler();
             if (destination == null) {
                 continue;
             }
-            if (isFull(destination)) {
+            int destinationSlots = destination.getSlots();
+            if (isFull(destination, destinationSlots)) {
+                if (backoff) {
+                    connection.onInsertFailed(side, gameTime, increment, maxDelay);
+                }
                 continue;
             }
-            for (int i = 0; i < itemHandler.getSlots(); i++) {
-                if (itemsToTransfer <= 0) {
-                    break connectionLoop;
-                }
+            nonFittingItems.clear();
+            boolean inserted = false;
+            boolean refused = false;
+            for (int i = 0; i < sourceSlots && itemsToTransfer > 0; i++) {
                 ItemStack simulatedExtract = itemHandler.extractItem(i, itemsToTransfer, true);
                 if (simulatedExtract.isEmpty()) {
                     continue;
@@ -200,29 +230,108 @@ public class ItemPipeType extends PipeType<Item, ItemData> {
                 if (containsStackable(nonFittingItems, simulatedExtract)) {
                     continue;
                 }
-                if (canInsert(tileEntity.getLevel().registryAccess(), connection, simulatedExtract, tileEntity.getFilters(side, this)) == tileEntity.getFilterMode(side, this).equals(UpgradeTileEntity.FilterMode.BLACKLIST)) {
+                if (canInsert(provider, connection, simulatedExtract, filters) == blacklist) {
+                    nonFittingItems.add(simulatedExtract);
                     continue;
                 }
-                ItemStack stack = ItemHandlerHelper.insertItem(destination, simulatedExtract, false);
+                ItemStack stack = insertItem(destination, destinationSlots, simulatedExtract);
                 int insertedAmount = simulatedExtract.getCount() - stack.getCount();
                 if (insertedAmount <= 0) {
                     nonFittingItems.add(simulatedExtract);
+                    refused = true;
+                    continue;
                 }
                 itemsToTransfer -= insertedAmount;
                 itemHandler.extractItem(i, insertedAmount, false);
+                inserted = true;
+            }
+            if (backoff) {
+                if (inserted) {
+                    connection.onInsertSuccess(side);
+                } else if (refused) {
+                    connection.onInsertFailed(side, gameTime, increment, maxDelay);
+                }
             }
         }
         return itemsToTransfer < initialItems;
     }
 
-    private boolean isFull(IItemHandler itemHandler) {
-        for (int i = 0; i < itemHandler.getSlots(); i++) {
+    /**
+     * Same as {@link net.neoforged.neoforge.items.ItemHandlerHelper#insertItem}, but doesn't query
+     * {@link IItemHandler#getSlots()} on every iteration, which is expensive for some inventories (e.g. Mekanism).
+     */
+    private static ItemStack insertItem(IItemHandler destination, int slots, ItemStack stack) {
+        for (int i = 0; i < slots; i++) {
+            stack = destination.insertItem(i, stack, false);
+            if (stack.isEmpty()) {
+                return ItemStack.EMPTY;
+            }
+        }
+        return stack;
+    }
+
+    private static boolean isFull(IItemHandler itemHandler, int slots) {
+        for (int i = 0; i < slots; i++) {
             ItemStack stackInSlot = itemHandler.getStackInSlot(i);
             if (stackInSlot.getCount() < itemHandler.getSlotLimit(i)) {
                 return false;
             }
         }
         return true;
+    }
+
+    /**
+     * Per operation state of a round robin destination.
+     */
+    private static final class Target {
+        private final PipeTileEntity.Connection connection;
+        @Nullable
+        private final IItemHandler handler;
+        private final int slots;
+        @Nullable
+        private ArrayList<ItemStack> rejected;
+        private boolean done;
+        private boolean inserted;
+        private boolean refused;
+
+        private Target(PipeTileEntity.Connection connection, Direction side, long gameTime, boolean backoff) {
+            this.connection = connection;
+            IItemHandler h = null;
+            int s = 0;
+            if (!backoff || !connection.isBackedOff(side, gameTime)) {
+                h = connection.getItemHandler();
+                if (h != null) {
+                    s = h.getSlots();
+                    // isFull is expensive on some inventories, so it is only checked once per operation.
+                    // After that a failed insert marks the destination as done anyway.
+                    if (isFull(h, s)) {
+                        refused = true;
+                        h = null;
+                    }
+                }
+            }
+            this.handler = h;
+            this.slots = s;
+        }
+
+        private boolean hasRejected(ItemStack stack) {
+            return rejected != null && containsStackable(rejected, stack);
+        }
+
+        private void reject(ItemStack stack) {
+            if (rejected == null) {
+                rejected = new ArrayList<>(4);
+            }
+            rejected.add(stack);
+        }
+
+        private void applyBackoff(Direction side, long gameTime, int increment, int maxDelay) {
+            if (inserted) {
+                connection.onInsertSuccess(side);
+            } else if (refused) {
+                connection.onInsertFailed(side, gameTime, increment, maxDelay);
+            }
+        }
     }
 
     private boolean canInsert(HolderLookup.Provider provider, PipeTileEntity.Connection connection, ItemStack stack, List<Filter<?, ?>> filters) {
@@ -270,7 +379,7 @@ public class ItemPipeType extends PipeType<Item, ItemData> {
         }
     }
 
-    private boolean containsStackable(ArrayList<ItemStack> list, ItemStack stack) {
+    private static boolean containsStackable(ArrayList<ItemStack> list, ItemStack stack) {
         for (int i = 0; i < list.size(); i++) {
             if (ItemUtils.isStackable(list.get(i), stack)) {
                 return true;

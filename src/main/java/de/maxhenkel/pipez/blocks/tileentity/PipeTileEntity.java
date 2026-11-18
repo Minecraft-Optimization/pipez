@@ -391,6 +391,10 @@ public abstract class PipeTileEntity extends BlockEntity implements ITickableBlo
 
         private Optional<BlockCapabilityCache<IChemicalHandler, Direction>> chemicalHandler;
 
+        // Per extracting side backoff for destinations that keep refusing inserts
+        private final long[] backoffUntil = new long[Direction.values().length];
+        private final int[] backoffDelay = new int[Direction.values().length];
+
         public Connection(ServerLevel level, BlockPos pos, Direction direction, int distance) {
             this.pos = pos;
             this.direction = direction;
@@ -425,6 +429,29 @@ public abstract class PipeTileEntity extends BlockEntity implements ITickableBlo
                     ", direction=" + direction +
                     ", distance=" + distance +
                     '}';
+        }
+
+        /**
+         * @return true if inserts from the given extracting side into this connection are currently backed off
+         */
+        public boolean isBackedOff(Direction extractingSide, long gameTime) {
+            return gameTime < backoffUntil[extractingSide.get3DDataValue()];
+        }
+
+        /**
+         * Called when this connection refused everything offered from the given extracting side.
+         * Each consecutive failure increases the time this connection is skipped.
+         */
+        public void onInsertFailed(Direction extractingSide, long gameTime, int increment, int maxDelay) {
+            int i = extractingSide.get3DDataValue();
+            backoffDelay[i] = Math.min(maxDelay, backoffDelay[i] + increment);
+            backoffUntil[i] = gameTime + backoffDelay[i];
+        }
+
+        public void onInsertSuccess(Direction extractingSide) {
+            int i = extractingSide.get3DDataValue();
+            backoffDelay[i] = 0;
+            backoffUntil[i] = 0L;
         }
 
         @Nullable
